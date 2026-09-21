@@ -333,6 +333,52 @@ impl<'input, CB: ParserCallbacks<'input>> Parser<'input, CB> {
     pub fn into_offset_iter(self) -> OffsetIter<'input, CB> {
         OffsetIter { parser: self }
     }
+
+    /// Consumes the event iterator and produces an iterator that produces
+    /// `(Event, Range, Provenance)` triples, where the `Range` value maps to
+    /// the corresponding range in the markdown source (exactly as
+    /// [`into_offset_iter`](struct.Parser.html#method.into_offset_iter)
+    /// would report it) and the [`Provenance`] value classifies the source
+    /// evidence that produced the event.
+    ///
+    /// This is an opt-in API: it borrows the input exactly like `Parser`
+    /// does and never requires an owned string, and parsers that only use
+    /// `Parser` or [`OffsetIter`] do not pay for provenance tracking.
+    ///
+    /// # Example: editor highlighting
+    ///
+    /// An editor can underline reference usages, offer "jump to definition"
+    /// and dim synthesized text without re-parsing the document:
+    ///
+    /// ```
+    /// use pulldown_cmark::{Event, Parser, Provenance, Tag};
+    ///
+    /// let src = "See [the docs][docs].\n\n[docs]: https://example.com/docs\n";
+    ///
+    /// for (event, range, provenance) in Parser::new(src).into_provenance_iter() {
+    ///     match provenance {
+    ///         Provenance::Reference { definition } => {
+    ///             // `range` is the usage site, `definition` is where the
+    ///             // reference was defined. Both can be highlighted and
+    ///             // linked together in the editor.
+    ///             assert_eq!(&src[range], "[the docs][docs]");
+    ///             assert_eq!(&src[definition], "[docs]: https://example.com/docs");
+    ///         }
+    ///         Provenance::Source => { /* highlight `range` directly */ }
+    ///         Provenance::Synthesized => { /* `range` triggered the event,
+    ///             but the event's bytes are not in the source */ }
+    ///         Provenance::Callback => { /* target came from the
+    ///             broken-link callback */ }
+    ///     }
+    /// #     std::mem::drop(event);
+    /// }
+    /// ```
+    pub fn into_provenance_iter(self) -> ProvenanceIter<'input, CB> {
+        ProvenanceIter {
+            parser: self,
+            open: Vec::new(),
+        }
+    }
 }
 
 impl<'input, F> Parser<'input, BrokenLinkCallback<F>> {
@@ -2309,6 +2355,86 @@ impl<'a, CB: ParserCallbacks<'a>> Iterator for OffsetIter<'a, CB> {
     }
 }
 
+/// Describes where the content of an event comes from.
+///
+/// Returned by [`ProvenanceIter`], which is constructed by
+/// [`Parser::into_provenance_iter`]. The primary range of the event (the
+/// same range [`OffsetIter`] would report) always accompanies the
+/// provenance; how it should be interpreted depends on the variant.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Provenance {
+    /// The event's bytes appear verbatim in the source at the event's range.
+    ///
+    /// This is used for direct text as well as container events, whose range
+    /// is the real source range of the container.
+    Source,
+    /// The event was synthesized by the parser.
+    ///
+    /// The event's range points at the source range that triggered it, but
+    /// the event's bytes do not necessarily appear in the source. Examples
+    /// include task list markers, smart punctuation, and NUL byte
+    /// replacements.
+    Synthesized,
+    /// The event's target was resolved from a reference definition.
+    ///
+    /// The event's own range is the use site of the reference, while
+    /// `definition` is the source range of the winning reference definition.
+    /// Multiple uses of the same reference share the same `definition`
+    /// range but each keep their own use site range.
+    Reference {
+        /// Source range of the reference definition.
+        definition: Range<usize>,
+    },
+    /// The event's target was provided by the broken-link callback rather
+    /// than by a reference definition in the document.
+    Callback,
+}
+
+/// Markdown event, source range and provenance iterator.
+///
+/// Generates tuples of the markdown event, its range in the source string
+/// (identical to what [`OffsetIter`] reports) and a [`Provenance`] value
+/// classifying the source evidence for the event.
+///
+/// Constructed from a `Parser` using its
+/// [`into_provenance_iter`](struct.Parser.html#method.into_provenance_iter)
+/// method.
+#[derive(Debug)]
+pub struct ProvenanceIter<'a, CB> {
+    parser: Parser<'a, CB>,
+    // Provenance of the currently open start tags. End events inherit the
+    // provenance of their matching start event.
+    open: Vec<Provenance>,
+}
+
+impl<'a, CB: ParserCallbacks<'a>> ProvenanceIter<'a, CB> {
+    /// Returns a reference to the internal reference definition tracker.
+    pub fn reference_definitions(&self) -> &RefDefs<'a> {
+        self.parser.reference_definitions()
+    }
+}
+
+impl<'a, CB: ParserCallbacks<'a>> Iterator for ProvenanceIter<'a, CB> {
+    type Item = (Event<'a>, Range<usize>, Provenance);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (event, range, provenance) = self
+            .parser
+            .inner
+            .next_event_provenance(&mut self.parser.callbacks)?;
+        let provenance = match event {
+            Event::Start(..) => {
+                let provenance = provenance.expect("start events carry provenance");
+                self.open.push(provenance.clone());
+                provenance
+            }
+            Event::End(..) => self.open.pop().unwrap_or(Provenance::Source),
+            _ => provenance.expect("leaf events carry provenance"),
+        };
+        Some((event, range, provenance))
+    }
+}
+
 impl<'a, CB: ParserCallbacks<'a>> Iterator for Parser<'a, CB> {
     type Item = Event<'a>;
 
@@ -2326,13 +2452,36 @@ impl<'input> ParserInner<'input> {
         &mut self,
         callbacks: &mut dyn ParserCallbacks<'input>,
     ) -> Option<(Event<'input>, Range<usize>)> {
+        self.next_event_impl(callbacks, false)
+            .map(|(event, range, _)| (event, range))
+    }
+
+    fn next_event_provenance(
+        &mut self,
+        callbacks: &mut dyn ParserCallbacks<'input>,
+    ) -> Option<(Event<'input>, Range<usize>, Option<Provenance>)> {
+        self.next_event_impl(callbacks, true)
+    }
+
+    /// Shared implementation of event generation.
+    ///
+    /// When `provenance` is set, start and leaf events are paired with
+    /// `Some` provenance. End events always carry `None`: their provenance
+    /// is inherited from the matching start event by [`ProvenanceIter`],
+    /// which is necessary because the allocations that would identify a
+    /// link's target have already been consumed by the start event.
+    fn next_event_impl(
+        &mut self,
+        callbacks: &mut dyn ParserCallbacks<'input>,
+        provenance: bool,
+    ) -> Option<(Event<'input>, Range<usize>, Option<Provenance>)> {
         match self.tree.cur() {
             None => {
                 let ix = self.tree.pop()?;
                 let ix = if matches!(self.tree[ix].item.body, ItemBody::TightParagraph) {
                     // tight paragraphs emit nothing
                     self.tree.next_sibling(ix);
-                    return self.next_event_range(callbacks);
+                    return self.next_event_impl(callbacks, provenance);
                 } else {
                     ix
                 };
@@ -2340,7 +2489,7 @@ impl<'input> ParserInner<'input> {
                 self.tree.next_sibling(ix);
                 let span = self.tree[ix].item.start..self.tree[ix].item.end;
                 debug_assert!(span.start <= span.end);
-                Some((Event::End(tag_end), span))
+                Some((Event::End(tag_end), span, None))
             }
             Some(cur_ix) => {
                 let cur_ix = if matches!(self.tree[cur_ix].item.body, ItemBody::TightParagraph) {
@@ -2356,6 +2505,14 @@ impl<'input> ParserInner<'input> {
 
                 let node = self.tree[cur_ix];
                 let item = node.item;
+                let provenance = provenance.then(|| {
+                    classify_provenance(
+                        &item.body,
+                        &self.allocs,
+                        self.text,
+                        &(item.start..item.end),
+                    )
+                });
                 let event = item_to_event(item, self.text, &mut self.allocs);
                 if let Event::Start(..) = event {
                     self.tree.push();
@@ -2363,9 +2520,60 @@ impl<'input> ParserInner<'input> {
                     self.tree.next_sibling(cur_ix);
                 }
                 debug_assert!(item.start <= item.end);
-                Some((event, item.start..item.end))
+                Some((event, item.start..item.end, provenance))
             }
         }
+    }
+}
+
+/// Determines the provenance of the event an item will produce.
+///
+/// This must be called with the item's body *before* `item_to_event` runs,
+/// since that function consumes the link and string allocations that some
+/// classifications rely on.
+fn classify_provenance(
+    body: &ItemBody,
+    allocs: &Allocations<'_>,
+    text: &str,
+    range: &Range<usize>,
+) -> Provenance {
+    match body {
+        ItemBody::Link(link_ix) | ItemBody::Image(link_ix) => {
+            let (link_type, _, _, id) = &allocs[*link_ix];
+            match link_type {
+                LinkType::Reference | LinkType::Collapsed | LinkType::Shortcut => allocs
+                    .refdefs
+                    .get(id.as_ref())
+                    .map(|def| Provenance::Reference {
+                        definition: def.span.clone(),
+                    })
+                    .unwrap_or(Provenance::Source),
+                LinkType::ReferenceUnknown
+                | LinkType::CollapsedUnknown
+                | LinkType::ShortcutUnknown => Provenance::Callback,
+                _ => source_or_replaced(text, range),
+            }
+        }
+        // Synthesized events point at the source range that triggered them,
+        // but their bytes do not necessarily appear in the source.
+        ItemBody::SynthesizeChar(_)
+        | ItemBody::SynthesizeText(_)
+        | ItemBody::OwnedInlineHtml(_)
+        | ItemBody::TaskListMarker(_) => Provenance::Synthesized,
+        // These bodies replace NUL bytes with U+FFFD when the event is
+        // produced, so their bytes only appear verbatim in the source when
+        // the source range contains no NUL.
+        ItemBody::Html | ItemBody::InlineHtml | ItemBody::Code(_) | ItemBody::Math(..) => {
+            source_or_replaced(text, range)
+        }
+        _ => Provenance::Source,
+    }
+}
+
+fn source_or_replaced(text: &str, range: &Range<usize>) -> Provenance {
+    match text.get(range.clone()) {
+        Some(slice) if slice.as_bytes().contains(&b'\0') => Provenance::Synthesized,
+        _ => Provenance::Source,
     }
 }
 
