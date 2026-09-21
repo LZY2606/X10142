@@ -173,6 +173,11 @@ impl<T: Default> Tree<T> {
         self.spine.iter()
     }
 
+    /// Iterates over all items in the tree, in node allocation order.
+    pub(crate) fn items(&self) -> impl Iterator<Item = &T> {
+        self.nodes.iter().map(|node| &node.item)
+    }
+
     /// Moves focus to the next sibling of the given node.
     pub(crate) fn next_sibling(&mut self, cur_ix: TreeIndex) -> Option<TreeIndex> {
         self.cur = self[cur_ix].next;

@@ -231,6 +231,11 @@ struct ParserInner<'input> {
     wikilink_stack: LinkStack,
     code_delims: CodeDelims,
     math_delims: MathDelims,
+
+    // Lazily-enabled source evidence tracking. Stays `None` on the normal
+    // parsing path so that no persistent allocations are made unless the
+    // provenance event stream is explicitly opted into.
+    provenance: Option<ProvenanceTracker<'input>>,
 }
 
 impl<'input, CB> core::fmt::Debug for Parser<'input, CB> {
@@ -317,6 +322,7 @@ impl<'input, CB: ParserCallbacks<'input>> Parser<'input, CB> {
                 link_ref_expansion_limit: text.len().max(100_000),
                 code_delims: CodeDelims::new(),
                 math_delims: MathDelims::new(),
+                provenance: None,
             },
         }
     }
@@ -332,6 +338,54 @@ impl<'input, CB: ParserCallbacks<'input>> Parser<'input, CB> {
     /// range in the markdown source.
     pub fn into_offset_iter(self) -> OffsetIter<'input, CB> {
         OffsetIter { parser: self }
+    }
+
+    /// Consumes the event iterator and produces an iterator that produces
+    /// `(Event, Provenance)` pairs, describing for every event which source
+    /// evidence it was derived from.
+    ///
+    /// This is an opt-in alternative to
+    /// [`into_offset_iter`](struct.Parser.html#method.into_offset_iter): the
+    /// emitted event sequence (and the primary ranges) are identical, but each
+    /// event is additionally classified so that tooling can tell direct source
+    /// text apart from reference definitions, broken-link callback results and
+    /// parser-synthesized output, without re-running the parser.
+    ///
+    /// The iterator borrows the input exactly like [`Parser`] does; the input
+    /// does not need to be an owned string. When this method is never called,
+    /// the normal parsing path performs no extra persistent allocations.
+    ///
+    /// # Example: editor-style highlighting
+    ///
+    /// ```
+    /// use pulldown_cmark::{Options, Parser, ProvenanceKind};
+    ///
+    /// let markdown = "[a link][ref] and a task:\n\n[ref]: /url\n\n- [x] done\n";
+    /// let mut options = Options::empty();
+    /// options.insert(Options::ENABLE_TASKLISTS);
+    ///
+    /// // Maps each event to a CSS class for a syntax highlighter.
+    /// fn highlight_class(kind: &ProvenanceKind) -> &'static str {
+    ///     match kind {
+    ///         ProvenanceKind::Direct => "md-direct",
+    ///         ProvenanceKind::Reference { .. } => "md-reference",
+    ///         ProvenanceKind::Callback => "md-callback",
+    ///         ProvenanceKind::Synthesized => "md-synthesized",
+    ///     }
+    /// }
+    ///
+    /// let parser = Parser::new_ext(markdown, options);
+    /// for (event, provenance) in parser.into_provenance_iter() {
+    ///     // `provenance.range` always points into the source. For references,
+    ///     // `ProvenanceKind::Reference` also carries the definition site, so a
+    ///     // "jump to definition" feature needs no second parse.
+    ///     let class = highlight_class(&provenance.kind);
+    ///     println!("{class:15} {:?} {:?}", provenance.range, event);
+    /// }
+    /// ```
+    pub fn into_provenance_iter(mut self) -> ProvenanceIter<'input, CB> {
+        self.inner.enable_provenance();
+        ProvenanceIter { parser: self }
     }
 }
 
@@ -381,12 +435,12 @@ impl<'input> ParserInner<'input> {
         span: Range<usize>,
         link_type: LinkType,
         callbacks: &mut dyn ParserCallbacks<'input>,
-    ) -> Option<(LinkType, CowStr<'input>, CowStr<'input>)> {
+    ) -> Option<(LinkType, CowStr<'input>, CowStr<'input>, LinkEvidence)> {
         if self.link_ref_expansion_limit == 0 {
             return None;
         }
 
-        let (link_type, url, title) = self
+        let (link_type, url, title, evidence) = self
             .allocs
             .refdefs
             .get(link_label.as_ref())
@@ -398,7 +452,8 @@ impl<'input> ParserInner<'input> {
                     .cloned()
                     .unwrap_or_else(|| "".into());
                 let url = matching_def.dest.clone();
-                (link_type, url, title)
+                let evidence = LinkEvidence::Definition(matching_def.span.clone());
+                (link_type, url, title, evidence)
             })
             .or_else(|| {
                 // Construct a BrokenLink struct, which will be passed to the callback
@@ -410,7 +465,9 @@ impl<'input> ParserInner<'input> {
 
                 callbacks
                     .handle_broken_link(broken_link)
-                    .map(|(url, title)| (link_type.to_unknown(), url, title))
+                    .map(|(url, title)| {
+                        (link_type.to_unknown(), url, title, LinkEvidence::Callback)
+                    })
             })?;
 
         // Limit expansion from link references.
@@ -420,7 +477,7 @@ impl<'input> ParserInner<'input> {
             .link_ref_expansion_limit
             .saturating_sub(url.len() + title.len());
 
-        Some((link_type, url, title))
+        Some((link_type, url, title, evidence))
     }
 
     /// Handle inline markup.
@@ -872,7 +929,7 @@ impl<'input> ParserInner<'input> {
                                     continue;
                                 }
                             } else if let Some((ReferenceLabel::Link(link_label), end)) = label {
-                                if let Some((def_link_type, url, title)) = self
+                                if let Some((def_link_type, url, title, evidence)) = self
                                     .fetch_link_type_url_title(
                                         link_label,
                                         (self.tree[tos.node].item.start)
@@ -883,6 +940,9 @@ impl<'input> ParserInner<'input> {
                                 {
                                     let link_ix =
                                         self.allocs.allocate_link(def_link_type, url, title, id);
+                                    if let Some(tracker) = self.provenance.as_mut() {
+                                        tracker.record_link(link_ix, evidence);
+                                    }
                                     self.tree[tos.node].item.body = if tos.ty == LinkStackTy::Image
                                     {
                                         ItemBody::Image(link_ix)
@@ -1948,6 +2008,41 @@ pub struct FootnoteDef {
     pub use_count: usize,
 }
 
+/// Records how a resolved link or image target came to be.
+#[derive(Clone, Debug)]
+pub(crate) enum LinkEvidence {
+    /// The target was resolved through a reference definition.
+    /// The range is the source span of the winning definition.
+    Definition(Range<usize>),
+    /// The target was supplied by the broken-link callback.
+    Callback,
+}
+
+/// Source-evidence side tables, populated only when the provenance event
+/// stream is opted into via [`Parser::into_provenance_iter`].
+#[derive(Debug, Default)]
+pub(crate) struct ProvenanceTracker<'a> {
+    /// Per-link evidence, indexed by `LinkIndex`. Entries are `None` for
+    /// links that map directly onto the source (inline links, autolinks,
+    /// wikilinks).
+    link_evidence: Vec<Option<LinkEvidence>>,
+    /// Source spans of footnote definition blocks, keyed by label.
+    footnote_def_spans: HashMap<FootnoteLabel<'a>, Range<usize>>,
+}
+
+impl<'a> ProvenanceTracker<'a> {
+    fn record_link(&mut self, ix: LinkIndex, evidence: LinkEvidence) {
+        if self.link_evidence.len() <= ix.0 {
+            self.link_evidence.resize(ix.0 + 1, None);
+        }
+        self.link_evidence[ix.0] = Some(evidence);
+    }
+
+    fn link_evidence(&self, ix: LinkIndex) -> Option<LinkEvidence> {
+        self.link_evidence.get(ix.0).cloned().flatten()
+    }
+}
+
 /// Tracks tree indices of code span delimiters of each length. It should prevent
 /// quadratic scanning behaviours by providing (amortized) constant time lookups.
 struct CodeDelims {
@@ -2309,6 +2404,81 @@ impl<'a, CB: ParserCallbacks<'a>> Iterator for OffsetIter<'a, CB> {
     }
 }
 
+/// Classification of the source evidence an event was derived from.
+///
+/// Returned as part of [`Provenance`] by [`ProvenanceIter`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProvenanceKind {
+    /// The event maps directly onto the source bytes at the primary range.
+    /// This includes literal text as well as container and structural events,
+    /// which use their real source ranges.
+    Direct,
+    /// The event was synthesized by the parser: its content does not
+    /// literally appear in the source. The primary range identifies the
+    /// source bytes that triggered the synthesis, e.g. the `[x]` of a task
+    /// list marker, the quote character of a smart quote, or a U+0000 byte
+    /// that was replaced by U+FFFD.
+    Synthesized,
+    /// The event was resolved through a reference or footnote definition.
+    /// The primary range is the use site; `definition` is the source range
+    /// of the winning definition. Multiple uses of the same reference share
+    /// the same definition range while keeping their own use sites.
+    Reference {
+        /// Source range of the definition this event was resolved from.
+        definition: Range<usize>,
+    },
+    /// The link target was supplied by the broken-link callback (see
+    /// [`Parser::new_with_broken_link_callback`]) rather than by any source
+    /// text. The primary range is the span of the would-be reference.
+    Callback,
+}
+
+/// Source range and evidence classification of a single event.
+///
+/// The primary `range` always falls within the input and is exactly the
+/// range that
+/// [`into_offset_iter`](struct.Parser.html#method.into_offset_iter) would
+/// report for the same event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Provenance {
+    /// Primary source range of the event.
+    pub range: Range<usize>,
+    /// Classification of the source evidence behind the event.
+    pub kind: ProvenanceKind,
+}
+
+/// Markdown event and provenance iterator.
+///
+/// Generates tuples where the first element is the markdown event and the
+/// second describes the source evidence the event was derived from. The
+/// event sequence is identical to the one produced by [`Parser`] and
+/// [`OffsetIter`].
+///
+/// Constructed from a `Parser` using its
+/// [`into_provenance_iter`](struct.Parser.html#method.into_provenance_iter)
+/// method.
+#[derive(Debug)]
+pub struct ProvenanceIter<'a, CB> {
+    parser: Parser<'a, CB>,
+}
+
+impl<'a, CB: ParserCallbacks<'a>> ProvenanceIter<'a, CB> {
+    /// Returns a reference to the internal reference definition tracker.
+    pub fn reference_definitions(&self) -> &RefDefs<'a> {
+        self.parser.reference_definitions()
+    }
+}
+
+impl<'a, CB: ParserCallbacks<'a>> Iterator for ProvenanceIter<'a, CB> {
+    type Item = (Event<'a>, Provenance);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.parser
+            .inner
+            .next_event_provenance(&mut self.parser.callbacks)
+    }
+}
+
 impl<'a, CB: ParserCallbacks<'a>> Iterator for Parser<'a, CB> {
     type Item = Event<'a>;
 
@@ -2322,25 +2492,90 @@ impl<'a, CB: ParserCallbacks<'a>> Iterator for Parser<'a, CB> {
 impl<'a, CB: ParserCallbacks<'a>> FusedIterator for Parser<'a, CB> {}
 
 impl<'input> ParserInner<'input> {
-    fn next_event_range(
+    /// Enables provenance tracking and collects the source spans of all
+    /// footnote definitions found by the first pass.
+    fn enable_provenance(&mut self) {
+        if self.provenance.is_some() {
+            return;
+        }
+        let mut tracker = ProvenanceTracker::default();
+        for item in self.tree.items() {
+            if let ItemBody::FootnoteDefinition(cow_ix) = item.body {
+                let label = UniCase::new(self.allocs[cow_ix].clone());
+                // The first definition wins, mirroring reference definitions.
+                tracker
+                    .footnote_def_spans
+                    .entry(label)
+                    .or_insert(item.start..item.end);
+            }
+        }
+        self.provenance = Some(tracker);
+    }
+
+    /// Classifies the source evidence of the event corresponding to `item`.
+    ///
+    /// Must be called before `item_to_event`, which consumes some of the
+    /// allocations the classification looks at. Returns `None` when
+    /// provenance tracking is not enabled.
+    fn provenance_for(&self, item: &Item) -> Option<Provenance> {
+        let tracker = self.provenance.as_ref()?;
+        let range = item.start..item.end;
+        let kind = match &item.body {
+            ItemBody::Link(link_ix) | ItemBody::Image(link_ix) => {
+                match tracker.link_evidence(*link_ix) {
+                    Some(LinkEvidence::Definition(definition)) => {
+                        ProvenanceKind::Reference { definition }
+                    }
+                    Some(LinkEvidence::Callback) => ProvenanceKind::Callback,
+                    None => ProvenanceKind::Direct,
+                }
+            }
+            ItemBody::FootnoteReference(cow_ix) => {
+                let label = UniCase::new(self.allocs[*cow_ix].clone());
+                match tracker.footnote_def_spans.get(&label) {
+                    Some(definition) => ProvenanceKind::Reference {
+                        definition: definition.clone(),
+                    },
+                    None => ProvenanceKind::Direct,
+                }
+            }
+            ItemBody::TaskListMarker(..)
+            | ItemBody::SynthesizeText(..)
+            | ItemBody::SynthesizeChar(..)
+            | ItemBody::OwnedInlineHtml(..) => ProvenanceKind::Synthesized,
+            ItemBody::Text { .. } | ItemBody::Html | ItemBody::InlineHtml
+                if memchr::memchr(0, self.text[item.start..item.end].as_bytes()).is_some() =>
+            {
+                // U+0000 is replaced by U+FFFD, so the emitted bytes do not
+                // literally appear in the source.
+                ProvenanceKind::Synthesized
+            }
+            _ => ProvenanceKind::Direct,
+        };
+        Some(Provenance { range, kind })
+    }
+
+    fn next_event_impl(
         &mut self,
         callbacks: &mut dyn ParserCallbacks<'input>,
-    ) -> Option<(Event<'input>, Range<usize>)> {
+    ) -> Option<(Event<'input>, Range<usize>, Option<Provenance>)> {
         match self.tree.cur() {
             None => {
                 let ix = self.tree.pop()?;
                 let ix = if matches!(self.tree[ix].item.body, ItemBody::TightParagraph) {
                     // tight paragraphs emit nothing
                     self.tree.next_sibling(ix);
-                    return self.next_event_range(callbacks);
+                    return self.next_event_impl(callbacks);
                 } else {
                     ix
                 };
-                let tag_end = body_to_tag_end(&self.tree[ix].item.body);
+                let item = self.tree[ix].item;
+                let provenance = self.provenance_for(&item);
+                let tag_end = body_to_tag_end(&item.body);
                 self.tree.next_sibling(ix);
-                let span = self.tree[ix].item.start..self.tree[ix].item.end;
+                let span = item.start..item.end;
                 debug_assert!(span.start <= span.end);
-                Some((Event::End(tag_end), span))
+                Some((Event::End(tag_end), span, provenance))
             }
             Some(cur_ix) => {
                 let cur_ix = if matches!(self.tree[cur_ix].item.body, ItemBody::TightParagraph) {
@@ -2356,6 +2591,7 @@ impl<'input> ParserInner<'input> {
 
                 let node = self.tree[cur_ix];
                 let item = node.item;
+                let provenance = self.provenance_for(&item);
                 let event = item_to_event(item, self.text, &mut self.allocs);
                 if let Event::Start(..) = event {
                     self.tree.push();
@@ -2363,9 +2599,28 @@ impl<'input> ParserInner<'input> {
                     self.tree.next_sibling(cur_ix);
                 }
                 debug_assert!(item.start <= item.end);
-                Some((event, item.start..item.end))
+                Some((event, item.start..item.end, provenance))
             }
         }
+    }
+
+    fn next_event_range(
+        &mut self,
+        callbacks: &mut dyn ParserCallbacks<'input>,
+    ) -> Option<(Event<'input>, Range<usize>)> {
+        let (event, range, _) = self.next_event_impl(callbacks)?;
+        Some((event, range))
+    }
+
+    fn next_event_provenance(
+        &mut self,
+        callbacks: &mut dyn ParserCallbacks<'input>,
+    ) -> Option<(Event<'input>, Provenance)> {
+        let (event, _range, provenance) = self.next_event_impl(callbacks)?;
+        // Reachable only through `ProvenanceIter`, which always enables
+        // provenance tracking first.
+        let provenance = provenance.expect("provenance tracking must be enabled");
+        Some((event, provenance))
     }
 }
 
